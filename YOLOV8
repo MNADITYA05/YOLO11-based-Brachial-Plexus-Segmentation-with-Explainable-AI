@@ -1,0 +1,259 @@
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+from ultralytics import YOLO
+from PIL import Image
+
+# Set paths
+image_dir = 'IMAGES'
+mask_dir = 'MASKS'
+output_dir = 'PREDICTIONS'
+
+# Create output directory if it doesn't exist
+os.makedirs(output_dir, exist_ok=True)
+
+# Load a pretrained YOLOv8 segmentation model
+model = YOLO('yolov8n-seg.pt')
+
+
+class EigenCAM:
+    def __init__(self, model):
+        self.model = model
+        self.activations = None
+        # Target the YOLO detection head features
+        self.target_layer = self.model.model.model[-3]
+
+    def get_activation(self, name):
+        def hook(module, input, output):
+            if isinstance(output, (list, tuple)):
+                self.activations = output[0] if isinstance(output, tuple) else output
+            else:
+                self.activations = output
+
+        return hook
+
+    def get_eigencam(self, img):
+        # Register hook
+        handle = self.target_layer.register_forward_hook(self.get_activation('target_layer'))
+
+        # Forward pass
+        with torch.no_grad():
+            self.model.predict(source=img, save=False, save_txt=False)
+
+        # Remove hook
+        handle.remove()
+
+        if self.activations is None:
+            raise ValueError("No activations were captured!")
+
+        # Get activations and move to CPU
+        activations = self.activations.cpu()
+
+        # Get the actual dimensions
+        if len(activations.shape) == 4:
+            b, c, h, w = activations.shape
+        else:
+            raise ValueError(f"Unexpected activation shape: {activations.shape}")
+
+        # Reshape activations for covariance calculation
+        activations_reshaped = activations.reshape(b, c, h * w)
+
+        # Calculate covariance matrix
+        cov_matrix = torch.bmm(activations_reshaped, activations_reshaped.transpose(1, 2))
+
+        try:
+            # Compute eigenvalues and eigenvectors
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix)
+
+            # Sort eigenvalues and eigenvectors
+            sorted_indices = torch.argsort(eigenvalues, dim=1, descending=True)
+            eigenvalues = torch.gather(eigenvalues, 1, sorted_indices)
+            eigenvectors = torch.gather(eigenvectors, 2,
+                                        sorted_indices.unsqueeze(1).expand(-1, eigenvectors.shape[1], -1))
+
+            # Weight the eigenvectors by their eigenvalues
+            weighted_eigenvectors = eigenvectors * eigenvalues.unsqueeze(1)
+
+            # Use top-k eigenvectors
+            k = min(3, eigenvalues.shape[1])
+            top_eigenvectors = weighted_eigenvectors[:, :, :k]
+
+            # Calculate weighted EigenCAM
+            eigen_cam = torch.zeros((b, 1, h * w), dtype=torch.float32)
+            for i in range(k):
+                eigen_cam += torch.abs(torch.bmm(
+                    top_eigenvectors[:, :, i].unsqueeze(2).transpose(1, 2),
+                    activations_reshaped
+                ))
+
+            # Reshape to spatial dimensions
+            eigen_cam = eigen_cam.reshape(b, 1, h, w)
+
+            # Normalize and resize
+            eigen_cam = F.interpolate(eigen_cam, size=(img.shape[0], img.shape[1]),
+                                      mode='bilinear', align_corners=False)
+            eigen_cam = eigen_cam.squeeze().numpy()
+            eigen_cam = (eigen_cam - eigen_cam.min()) / (eigen_cam.max() - eigen_cam.min() + 1e-8)
+
+            # Invert the attention map
+            eigen_cam = 1 - eigen_cam
+
+            return eigen_cam
+
+        except RuntimeError as e:
+            print(f"Error in eigenvalue computation: {e}")
+            # Fallback: return a simple inverted feature visualization
+            feature_map = torch.mean(activations, dim=1, keepdim=True)
+            feature_map = F.interpolate(feature_map, size=(img.shape[0], img.shape[1]),
+                                        mode='bilinear', align_corners=False)
+            feature_map = feature_map.squeeze().numpy()
+            feature_map = (feature_map - feature_map.min()) / (feature_map.max() - feature_map.min() + 1e-8)
+            feature_map = 1 - feature_map  # Invert the feature map
+            return feature_map
+
+
+def preprocess_image(image_path, mask_path):
+    # Read image and mask
+    image = cv2.imread(image_path)
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
+    # Ensure mask and image have the same dimensions
+    if image.shape[:2] != mask.shape:
+        mask = cv2.resize(mask, (image.shape[1], image.shape[0]))
+
+    # Convert binary mask to RGB
+    mask_rgb = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    mask_rgb[mask > 0] = [0, 255, 0]  # Green for the masked area
+
+    # Combine original image and colored mask
+    alpha = 0.5
+    combined = cv2.addWeighted(image, 1, mask_rgb, alpha, 0)
+
+    return image, mask, combined
+
+
+def create_combined_output(original_image, ground_truth, predicted, eigencam, dice_coeff, iou):
+    # Ensure all images are the same size
+    h, w = original_image.shape[:2]
+    ground_truth = cv2.resize(ground_truth, (w, h))
+    predicted = cv2.resize(predicted, (w, h))
+
+    # Create heatmap from EigenCAM
+    eigencam_normalized = (eigencam * 255).astype(np.uint8)
+    eigencam_heatmap = cv2.applyColorMap(eigencam_normalized, cv2.COLORMAP_JET)
+    eigencam_resized = cv2.resize(eigencam_heatmap, (w, h))
+
+    # Create a more detailed heatmap overlay
+    eigencam_overlay = cv2.addWeighted(original_image, 0.6, eigencam_resized, 0.4, 0)
+
+    # Add contours of the predicted mask to the EigenCAM visualization
+    pred_mask_uint8 = predicted.astype(np.uint8)
+    contours, _ = cv2.findContours(pred_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(eigencam_overlay, contours, -1, (255, 255, 255), 2)
+
+    # Convert ground truth and predicted masks to RGB for visualization
+    ground_truth_rgb = cv2.cvtColor(ground_truth, cv2.COLOR_GRAY2RGB)
+    predicted_rgb = cv2.cvtColor(predicted, cv2.COLOR_GRAY2RGB)
+
+    # Create white background for metrics and headlines
+    metrics_height = 90
+    bottom_space = 60
+    gap_width = 20
+    total_width = w * 4 + gap_width * 3
+
+    top_background = np.ones((metrics_height, total_width, 3), dtype=np.uint8) * 255
+    bottom_background = np.ones((bottom_space, total_width, 3), dtype=np.uint8) * 255
+
+    # Add metrics to top background
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(top_background, f'Dice: {dice_coeff:.4f}', (10, 30), font, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(top_background, f'IoU: {iou:.4f}', (10, 55), font, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
+
+    # Add headlines
+    cv2.putText(top_background, 'Original', (w // 2 - 40, 80), font, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(top_background, 'Ground Truth', (w + gap_width + w // 2 - 70, 80), font, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(top_background, 'Predicted', (2 * w + 2 * gap_width + w // 2 - 50, 80), font, 0.8, (0, 0, 0), 2,
+                cv2.LINE_AA)
+    cv2.putText(top_background, 'EigenCAM', (3 * w + 3 * gap_width + w // 2 - 50, 80), font, 0.8, (0, 0, 0), 2,
+                cv2.LINE_AA)
+
+    # Create white vertical bars for gaps
+    vertical_bar = np.ones((h, gap_width, 3), dtype=np.uint8) * 255
+
+    # Combine the images horizontally with gaps
+    combined = np.hstack((original_image, vertical_bar, ground_truth_rgb, vertical_bar,
+                          predicted_rgb, vertical_bar, eigencam_overlay))
+
+    # Combine top background, image, and bottom background
+    final_output = np.vstack((top_background, combined, bottom_background))
+
+    return final_output
+
+
+def calculate_iou(ground_truth, prediction):
+    intersection = np.logical_and(ground_truth, prediction)
+    union = np.logical_or(ground_truth, prediction)
+    iou = np.sum(intersection) / np.sum(union)
+    return iou
+
+
+def process_images():
+    # Initialize EigenCAM
+    eigencam = EigenCAM(model)
+
+    for filename in os.listdir(image_dir):
+        if filename.endswith('.png') and not filename.endswith('_mask.png'):
+            image_path = os.path.join(image_dir, filename)
+            mask_filename = f"{os.path.splitext(filename)[0]}_mask.png"
+            mask_path = os.path.join(mask_dir, mask_filename)
+
+            if os.path.exists(mask_path):
+                try:
+                    # Preprocess image and mask
+                    original_image, original_mask, combined = preprocess_image(image_path, mask_path)
+
+                    # Generate EigenCAM
+                    eigen_cam = eigencam.get_eigencam(combined)
+
+                    # Perform segmentation on the combined image
+                    results = model(combined)
+
+                    if results[0].masks is not None:
+                        # Get the predicted mask
+                        pred_mask = results[0].masks.data.cpu().numpy()[0]
+
+                        # Resize predicted mask to match original image size
+                        pred_mask = cv2.resize(pred_mask, (original_image.shape[1], original_image.shape[0]))
+
+                        # Convert predicted mask to 0-255 range
+                        pred_mask = (pred_mask * 255).astype(np.uint8)
+
+                        # Calculate Dice coefficient
+                        intersection = np.logical_and(original_mask > 0, pred_mask > 0)
+                        dice_coeff = (2. * intersection.sum()) / ((original_mask > 0).sum() + (pred_mask > 0).sum())
+
+                        # Calculate IoU
+                        iou = calculate_iou(original_mask > 0, pred_mask > 0)
+
+                        # Create combined output with metrics and EigenCAM
+                        combined_output = create_combined_output(original_image, original_mask, pred_mask,
+                                                                 eigen_cam, dice_coeff, iou)
+
+                        # Save results
+                        base_filename = os.path.splitext(filename)[0]
+                        cv2.imwrite(os.path.join(output_dir, f"{base_filename}_combined_output.png"), combined_output)
+
+                        print(f"Processed {filename}. Results saved in the output directory.")
+                    else:
+                        print(f"No mask detected for {filename}")
+                except Exception as e:
+                    print(f"Error processing {filename}: {str(e)}")
+            else:
+                print(f"Mask not found for {filename}")
+
+
+if __name__ == "__main__":
+    process_images()
+    print("Segmentation and EigenCAM visualization complete. Results saved in the output directory.")
