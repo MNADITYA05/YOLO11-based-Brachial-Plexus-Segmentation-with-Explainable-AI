@@ -18,8 +18,8 @@ output_dir = 'PREDICTIONS'
 # Create output directory if it doesn't exist
 os.makedirs(output_dir, exist_ok=True)
 
-# Load a pretrained YOLOv8 segmentation model
-model = YOLO('yolo11n-seg.pt')
+# Load a pretrained YOLO11 segmentation model
+model = YOLO('yolo11s-seg.pt')
 print(model)
 
 
