@@ -1,0 +1,11 @@
+Mean Metrics Across All Images
+------------------------------
+Number of images processed: 2330
+------------------------------
+
+Accuracy: 0.9967
+Precision: 0.9049
+Recall: 0.9597
+F1 Score: 0.9313
+Iou: 0.8861
+Dice Coeff: 0.9313
