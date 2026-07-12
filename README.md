@@ -99,11 +99,11 @@ flowchart TD
     C --> D{Mask Detected?}
     D -- No --> E[Log: No mask detected\nSkip image]
     D -- Yes --> F[Extract Predicted Mask\nResize to original dims]
-    F --> G[EigenCAM\nHook → Covariance → Top-3 Eigenvectors]
+    F --> G[EigenCAM\nHook to Covariance to Top-3 Eigenvectors]
     F --> H[Metric Computation\nTP · FP · TN · FN]
     G --> I[Heatmap Overlay\nJET colormap on original image]
     H --> J[Per-image Metrics\nDice · IoU · Acc · Prec · Rec · F1]
-    I --> K[4-Panel Output\nOriginal | Ground Truth | Prediction | EigenCAM]
+    I --> K[4-Panel Output\nOriginal · GT · Prediction · EigenCAM]
     J --> K
     K --> L([Save to PREDICTIONS/])
     J --> M[Accumulate across dataset]
