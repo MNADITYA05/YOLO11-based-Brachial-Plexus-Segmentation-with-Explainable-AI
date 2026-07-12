@@ -1,421 +1,211 @@
+"""
+YOLO11-based Brachial Plexus Segmentation — inference & evaluation pipeline.
+
+Runs YOLO11 instance segmentation over a directory of medical images,
+evaluates predictions against ground truth masks using six metrics,
+generates per-image EigenCAM XAI visualisations, and produces a
+dataset-level normalised confusion matrix and mean metrics summary.
+
+Usage:
+    # Default config
+    python YOLO11.py
+
+    # Custom config file
+    python YOLO11.py --config config/yolo11.yaml
+
+    # Override individual paths without editing the config
+    python YOLO11.py --image-dir IMAGES --mask-dir MASKS --output-dir PREDICTIONS
+
+    # Override model weights
+    python YOLO11.py --weights runs/train/yolo11_brachial/weights/best.pt
+"""
+
+import argparse
+import logging
 import os
+
 import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
+import yaml
 from ultralytics import YOLO
-from PIL import Image
-import seaborn as sns
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
-from collections import defaultdict
 
-# Set paths
-image_dir = 'IMAGES'
-mask_dir = 'MASKS'
-output_dir = 'PREDICTIONS'
+from src.evaluation.metrics import (
+    calculate_metrics,
+    generate_confusion_matrix,
+    plot_confusion_matrix,
+    save_mean_metrics,
+)
+from src.explainability.eigencam import EigenCAM
+from src.visualization.panels import create_combined_output
 
-# Create output directory if it doesn't exist
-os.makedirs(output_dir, exist_ok=True)
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-# Load a pretrained YOLO11 segmentation model
-model = YOLO('yolo11s-seg.pt')
-print(model)
-
-
-class EigenCAM:
-    def __init__(self, model):
-        self.model = model
-        self.activations = None
-        # Target the YOLO detection head features
-        self.target_layer = self.model.model.model[-3]
-
-    def get_activation(self, name):
-        def hook(module, input, output):
-            if isinstance(output, (list, tuple)):
-                self.activations = output[0] if isinstance(output, tuple) else output
-            else:
-                self.activations = output
-
-        return hook
-
-    def get_eigencam(self, img):
-        # Register hook
-        handle = self.target_layer.register_forward_hook(self.get_activation('target_layer'))
-
-        # Forward pass
-        with torch.no_grad():
-            self.model.predict(source=img, save=False, save_txt=False)
-
-        # Remove hook
-        handle.remove()
-
-        if self.activations is None:
-            raise ValueError("No activations were captured!")
-
-        # Get activations and move to CPU
-        activations = self.activations.cpu()
-
-        # Get the actual dimensions
-        if len(activations.shape) == 4:
-            b, c, h, w = activations.shape
-        else:
-            raise ValueError(f"Unexpected activation shape: {activations.shape}")
-
-        # Reshape activations for covariance calculation
-        activations_reshaped = activations.reshape(b, c, h * w)
-
-        # Calculate covariance matrix
-        cov_matrix = torch.bmm(activations_reshaped, activations_reshaped.transpose(1, 2))
-
-        try:
-            # Compute eigenvalues and eigenvectors
-            eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix)
-
-            # Sort eigenvalues and eigenvectors
-            sorted_indices = torch.argsort(eigenvalues, dim=1, descending=True)
-            eigenvalues = torch.gather(eigenvalues, 1, sorted_indices)
-            eigenvectors = torch.gather(eigenvectors, 2,
-                                        sorted_indices.unsqueeze(1).expand(-1, eigenvectors.shape[1], -1))
-
-            # Weight the eigenvectors by their eigenvalues
-            weighted_eigenvectors = eigenvectors * eigenvalues.unsqueeze(1)
-
-            # Use top-k eigenvectors
-            k = min(3, eigenvalues.shape[1])
-            top_eigenvectors = weighted_eigenvectors[:, :, :k]
-
-            # Calculate weighted EigenCAM
-            eigen_cam = torch.zeros((b, 1, h * w), dtype=torch.float32)
-            for i in range(k):
-                eigen_cam += torch.abs(torch.bmm(
-                    top_eigenvectors[:, :, i].unsqueeze(2).transpose(1, 2),
-                    activations_reshaped
-                ))
-
-            # Reshape to spatial dimensions
-            eigen_cam = eigen_cam.reshape(b, 1, h, w)
-
-            # Normalize and resize
-            eigen_cam = F.interpolate(eigen_cam, size=(img.shape[0], img.shape[1]),
-                                      mode='bilinear', align_corners=False)
-            eigen_cam = eigen_cam.squeeze().numpy()
-            eigen_cam = (eigen_cam - eigen_cam.min()) / (eigen_cam.max() - eigen_cam.min() + 1e-8)
-
-            # Invert the attention map
-            eigen_cam = 1 - eigen_cam
-
-            return eigen_cam
-
-        except RuntimeError as e:
-            print(f"Error in eigenvalue computation: {e}")
-            # Fallback: return a simple inverted feature visualization
-            feature_map = torch.mean(activations, dim=1, keepdim=True)
-            feature_map = F.interpolate(feature_map, size=(img.shape[0], img.shape[1]),
-                                        mode='bilinear', align_corners=False)
-            feature_map = feature_map.squeeze().numpy()
-            feature_map = (feature_map - feature_map.min()) / (feature_map.max() - feature_map.min() + 1e-8)
-            feature_map = 1 - feature_map  # Invert the feature map
-            return feature_map
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s — %(message)s',
+    datefmt='%H:%M:%S',
+)
+logger = logging.getLogger(__name__)
 
 
-def preprocess_image(image_path, mask_path):
-    # Read image and mask
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description='YOLO11 Brachial Plexus Segmentation + EigenCAM evaluation',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument('--config',     default='config/yolo11.yaml',
+                        help='Path to the project YAML config file.')
+    parser.add_argument('--image-dir',  default=None,
+                        help='Override config: directory of input images.')
+    parser.add_argument('--mask-dir',   default=None,
+                        help='Override config: directory of ground truth masks.')
+    parser.add_argument('--output-dir', default=None,
+                        help='Override config: directory for all outputs.')
+    parser.add_argument('--weights',    default=None,
+                        help='Override config: YOLO model weights path.')
+    return parser.parse_args()
+
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+# ---------------------------------------------------------------------------
+# Image loading  (no mask blending — raw image goes to the model)
+# ---------------------------------------------------------------------------
+
+def preprocess_image(image_path: str, mask_path: str) -> tuple:
+    """
+    Load an image and its corresponding ground truth mask.
+
+    The mask is resized to match the image if dimensions differ.
+    The raw image is returned as-is — no annotation is blended onto it
+    before inference, ensuring the model cannot observe the ground truth.
+
+    Args:
+        image_path: Path to the input image (.png).
+        mask_path:  Path to the binary ground truth mask (.png).
+
+    Returns:
+        (image, mask) — both as numpy arrays (BGR and grayscale respectively).
+    """
     image = cv2.imread(image_path)
-    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    mask  = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
 
-    # Ensure mask and image have the same dimensions
     if image.shape[:2] != mask.shape:
         mask = cv2.resize(mask, (image.shape[1], image.shape[0]))
 
-    # Convert binary mask to RGB
-    mask_rgb = np.zeros((*mask.shape, 3), dtype=np.uint8)
-    mask_rgb[mask > 0] = [0, 255, 0]  # Green for the masked area
-
-    # Combine original image and colored mask
-    alpha = 0.5
-    combined = cv2.addWeighted(image, 1, mask_rgb, alpha, 0)
-
-    return image, mask, combined
+    return image, mask
 
 
-def calculate_metrics(ground_truth, prediction):
-    """
-    Calculate various metrics for segmentation evaluation
-    """
-    # Convert to boolean arrays
-    ground_truth = ground_truth > 0
-    prediction = prediction > 0
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
 
-    # Calculate True Positives, False Positives, True Negatives, False Negatives
-    TP = np.sum(np.logical_and(prediction, ground_truth))
-    FP = np.sum(np.logical_and(prediction, ~ground_truth))
-    TN = np.sum(np.logical_and(~prediction, ~ground_truth))
-    FN = np.sum(np.logical_and(~prediction, ground_truth))
+def process_images(cfg: dict) -> None:
+    image_dir  = cfg['data']['image_dir']
+    mask_dir   = cfg['data']['mask_dir']
+    output_dir = cfg['data']['output_dir']
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Calculate metrics
-    accuracy = (TP + TN) / (TP + TN + FP + FN + 1e-8)
-    precision = TP / (TP + FP + 1e-8)
-    recall = TP / (TP + FN + 1e-8)
-    f1_score = 2 * (precision * recall) / (precision + recall + 1e-8)
+    logger.info(f"Loading model: {cfg['model']['weights']}")
+    model    = YOLO(cfg['model']['weights'])
+    eigencam = EigenCAM(
+        model,
+        target_layer_index=cfg['model']['target_layer_index'],
+        top_k=cfg['eigencam']['top_k'],
+    )
 
-    # Calculate IoU
-    intersection = np.logical_and(ground_truth, prediction)
-    union = np.logical_or(ground_truth, prediction)
-    iou = np.sum(intersection) / (np.sum(union) + 1e-8)
+    all_gt, all_pred, all_metrics = [], [], []
 
-    # Calculate Dice coefficient
-    dice_coeff = (2. * TP) / (2 * TP + FP + FN + 1e-8)
+    filenames = sorted(
+        f for f in os.listdir(image_dir)
+        if f.endswith('.png') and not f.endswith('_mask.png')
+    )
+    logger.info(f"Found {len(filenames)} images in {image_dir!r}")
 
-    return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1_score': f1_score,
-        'iou': iou,
-        'dice_coeff': dice_coeff
-    }
+    for filename in filenames:
+        image_path = os.path.join(image_dir, filename)
+        mask_path  = os.path.join(mask_dir, f"{os.path.splitext(filename)[0]}_mask.png")
 
+        if not os.path.exists(mask_path):
+            logger.warning(f"Mask not found for {filename} — skipping.")
+            continue
 
-def create_combined_output(original_image, ground_truth, predicted, eigencam, metrics):
-    # Ensure all images are the same size
-    h, w = original_image.shape[:2]
-    ground_truth = cv2.resize(ground_truth, (w, h))
-    predicted = cv2.resize(predicted, (w, h))
+        try:
+            image, mask = preprocess_image(image_path, mask_path)
 
-    # Create heatmap from EigenCAM
-    eigencam_normalized = (eigencam * 255).astype(np.uint8)
-    eigencam_heatmap = cv2.applyColorMap(eigencam_normalized, cv2.COLORMAP_JET)
-    eigencam_resized = cv2.resize(eigencam_heatmap, (w, h))
+            # EigenCAM and inference both receive the raw image only
+            eigen_cam = eigencam.get_eigencam(image)
+            results   = model(image)
 
-    # Create a more detailed heatmap overlay
-    eigencam_overlay = cv2.addWeighted(original_image, 0.6, eigencam_resized, 0.4, 0)
+            if results[0].masks is None:
+                logger.warning(f"No mask detected for {filename} — skipping.")
+                continue
 
-    # Create prediction overlay
-    prediction_overlay = np.zeros_like(original_image)
-    prediction_overlay[predicted > 0] = original_image[predicted > 0]
-    pred_mask_uint8 = predicted.astype(np.uint8)
-    contours, _ = cv2.findContours(pred_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(prediction_overlay, contours, -1, (0, 255, 0), 1)
+            pred_mask = results[0].masks.data.cpu().numpy()[0]
+            pred_mask = cv2.resize(pred_mask, (image.shape[1], image.shape[0]))
+            pred_mask = (pred_mask * 255).astype(np.uint8)
 
-    # Create ground truth overlay
-    ground_truth_overlay = np.zeros_like(original_image)
-    ground_truth_overlay[ground_truth > 0] = original_image[ground_truth > 0]
-    ground_truth_uint8 = ground_truth.astype(np.uint8)
-    gt_contours, _ = cv2.findContours(ground_truth_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(ground_truth_overlay, gt_contours, -1, (0, 255, 0), 1)
+            metrics = calculate_metrics(mask, pred_mask)
+            all_gt.append(mask)
+            all_pred.append(pred_mask)
+            all_metrics.append(metrics)
 
-    # Create metrics and headlines
-    metrics_height = 140  # Increased height for additional metrics
-    bottom_space = 60
-    gap_width = 20
-    total_width = w * 4 + gap_width * 3
+            panel = create_combined_output(
+                image, mask, pred_mask, eigen_cam, metrics,
+                gap_width=cfg['visualization']['panel_gap_width'],
+                metrics_height=cfg['visualization']['metrics_header_height'],
+                bottom_space=cfg['visualization']['bottom_space'],
+                blend_alpha=cfg['eigencam']['blend_alpha'],
+            )
+            out_path = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}_combined_output.png")
+            cv2.imwrite(out_path, panel)
+            logger.info(
+                f"Processed {filename} — "
+                + ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+            )
 
-    top_background = np.ones((metrics_height, total_width, 3), dtype=np.uint8) * 255
-    bottom_background = np.ones((bottom_space, total_width, 3), dtype=np.uint8) * 255
+        except Exception as exc:
+            logger.error(f"Error processing {filename}: {exc}")
 
-    # Add metrics to top background
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    metrics_text = [
-        f'Dice: {metrics["dice_coeff"]:.4f}',
-        f'IoU: {metrics["iou"]:.4f}',
-        f'Accuracy: {metrics["accuracy"]:.4f}',
-        f'Precision: {metrics["precision"]:.4f}',
-        f'Recall: {metrics["recall"]:.4f}',
-        f'F1 Score: {metrics["f1_score"]:.4f}'
-    ]
+    # Dataset-level outputs
+    if all_gt and all_pred:
+        cm = generate_confusion_matrix(all_gt, all_pred)
+        plot_confusion_matrix(cm, os.path.join(output_dir, 'confusion_matrix.png'))
 
-    for i, text in enumerate(metrics_text):
-        y_pos = 25 + i * 20
-        cv2.putText(top_background, text, (10, y_pos), font, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
-
-    # Add headlines
-    cv2.putText(top_background, 'Original', (w // 2 - 40, metrics_height - 10), font, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
-    cv2.putText(top_background, 'Ground Truth', (w + gap_width + w // 2 - 70, metrics_height - 10), font, 0.8,
-                (0, 0, 0), 2, cv2.LINE_AA)
-    cv2.putText(top_background, 'Prediction', (2 * w + 2 * gap_width + w // 2 - 50, metrics_height - 10), font, 0.8,
-                (0, 0, 0), 2, cv2.LINE_AA)
-    cv2.putText(top_background, 'EigenCAM', (3 * w + 3 * gap_width + w // 2 - 50, metrics_height - 10), font, 0.8,
-                (0, 0, 0), 2, cv2.LINE_AA)
-
-    # Create white vertical bars for gaps
-    vertical_bar = np.ones((h, gap_width, 3), dtype=np.uint8) * 255
-
-    # Combine the images horizontally with gaps
-    combined = np.hstack((original_image, vertical_bar,
-                          ground_truth_overlay, vertical_bar,
-                          prediction_overlay, vertical_bar,
-                          eigencam_overlay))
-
-    # Combine top background, image, and bottom background
-    final_output = np.vstack((top_background, combined, bottom_background))
-
-    return final_output
-
-
-def calculate_iou(ground_truth, prediction):
-    intersection = np.logical_and(ground_truth, prediction)
-    union = np.logical_or(ground_truth, prediction)
-    iou = np.sum(intersection) / np.sum(union)
-    return iou
-
-
-def generate_confusion_matrix(all_ground_truth, all_predictions):
-    """
-    Generate a confusion matrix for segmentation results across all images
-    """
-    # Flatten all masks and stack them
-    gt_flat = np.concatenate([gt.flatten() for gt in all_ground_truth])
-    pred_flat = np.concatenate([pred.flatten() for pred in all_predictions])
-
-    # Convert to binary
-    gt_flat = gt_flat > 0
-    pred_flat = pred_flat > 0
-
-    # Calculate confusion matrix
-    cm = confusion_matrix(gt_flat, pred_flat, normalize='true')
-
-    return cm
-
-
-def plot_confusion_matrix(cm, save_path):
-    """
-    Plot and save a confusion matrix with proper labels and colormap
-    """
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm * 100,
-                annot=True,
-                fmt='.1f',
-                cmap='Blues',
-                xticklabels=['Background', 'Foreground'],
-                yticklabels=['Background', 'Foreground'])
-
-    plt.title('Normalized Segmentation Confusion Matrix (%)')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-
-    plt.savefig(save_path, bbox_inches='tight', dpi=300)
-    plt.close()
-
-
-def save_mean_metrics(all_metrics, output_dir):
-    """
-    Calculate and save mean metrics across all processed images
-    """
-    # Calculate mean metrics
-    mean_metrics = {}
-    num_images = len(all_metrics)
-
-    if num_images > 0:
-        # Initialize sums for each metric
-        metric_sums = defaultdict(float)
-
-        # Sum up all metrics
-        for metrics in all_metrics:
-            for metric_name, value in metrics.items():
-                metric_sums[metric_name] += value
-
-        # Calculate means
-        mean_metrics = {metric: value / num_images for metric, value in metric_sums.items()}
-
-        # Save to file
-        output_path = os.path.join(output_dir, 'mean_metrics.txt')
-        with open(output_path, 'w') as f:
-            f.write("Mean Metrics Across All Images\n")
-            f.write("-" * 30 + "\n")
-            f.write(f"Number of images processed: {num_images}\n")
-            f.write("-" * 30 + "\n\n")
-
-            for metric_name, value in mean_metrics.items():
-                f.write(f"{metric_name.replace('_', ' ').title()}: {value:.4f}\n")
-
-        print(f"Mean metrics saved to {output_path}")
-    else:
-        print("No metrics to average - no images were successfully processed")
-
-    return mean_metrics
-
-
-def process_images():
-    # Initialize EigenCAM
-    eigencam = EigenCAM(model)
-
-    # Lists to store all ground truth and predicted masks
-    all_ground_truth = []
-    all_predictions = []
-    all_metrics = []  # List to store metrics for each image
-
-    for filename in os.listdir(image_dir):
-        if filename.endswith('.png') and not filename.endswith('_mask.png'):
-            image_path = os.path.join(image_dir, filename)
-            mask_filename = f"{os.path.splitext(filename)[0]}_mask.png"
-            mask_path = os.path.join(mask_dir, mask_filename)
-
-            if os.path.exists(mask_path):
-                try:
-                    # Preprocess image and mask
-                    original_image, original_mask, combined = preprocess_image(image_path, mask_path)
-
-                    # Generate EigenCAM
-                    eigen_cam = eigencam.get_eigencam(combined)
-
-                    # Perform segmentation on the combined image
-                    results = model(combined)
-
-                    if results[0].masks is not None:
-                        # Get the predicted mask
-                        pred_mask = results[0].masks.data.cpu().numpy()[0]
-
-                        # Resize predicted mask to match original image size
-                        pred_mask = cv2.resize(pred_mask, (original_image.shape[1], original_image.shape[0]))
-
-                        # Convert predicted mask to 0-255 range
-                        pred_mask = (pred_mask * 255).astype(np.uint8)
-
-                        # Store masks for confusion matrix
-                        all_ground_truth.append(original_mask)
-                        all_predictions.append(pred_mask)
-
-                        # Calculate all metrics
-                        metrics = calculate_metrics(original_mask, pred_mask)
-                        all_metrics.append(metrics)  # Store metrics for this image
-
-                        # Create combined output with metrics and EigenCAM
-                        combined_output = create_combined_output(original_image, original_mask, pred_mask,
-                                                                 eigen_cam, metrics)
-
-                        # Save results
-                        base_filename = os.path.splitext(filename)[0]
-                        cv2.imwrite(os.path.join(output_dir, f"{base_filename}_combined_output.png"), combined_output)
-
-                        print(f"Processed {filename}. Results saved in the output directory.")
-                        print("Metrics:", {k: f"{v:.4f}" for k, v in metrics.items()})
-                    else:
-                        print(f"No mask detected for {filename}")
-                except Exception as e:
-                    print(f"Error processing {filename}: {str(e)}")
-            else:
-                print(f"Mask not found for {filename}")
-
-    # Generate and save confusion matrix
-    if all_ground_truth and all_predictions:
-        confusion_mat = generate_confusion_matrix(all_ground_truth, all_predictions)
-        plot_confusion_matrix(confusion_mat, os.path.join(output_dir, 'confusion_matrix.png'))
-        print("Confusion matrix generated and saved.")
-
-    # Calculate and save mean metrics
     mean_metrics = save_mean_metrics(all_metrics, output_dir)
-
-    # Print summary
     if mean_metrics:
-        print("\nMean Metrics Summary:")
-        for metric_name, value in mean_metrics.items():
-            print(f"{metric_name}: {value:.4f}")
+        logger.info("Mean metrics summary:")
+        for k, v in mean_metrics.items():
+            logger.info(f"  {k}: {v:.4f}")
 
 
-if __name__ == "__main__":
-    process_images()
-    print("\nSegmentation analysis complete. Results saved in the output directory.")
-    print("- Individual image results")
-    print("- Confusion matrix")
-    print("- Mean metrics summary")
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    args = parse_args()
+    cfg  = load_config(args.config)
+
+    # CLI arguments override config file values
+    if args.image_dir:  cfg['data']['image_dir']  = args.image_dir
+    if args.mask_dir:   cfg['data']['mask_dir']   = args.mask_dir
+    if args.output_dir: cfg['data']['output_dir'] = args.output_dir
+    if args.weights:    cfg['model']['weights']   = args.weights
+
+    process_images(cfg)
+    logger.info("Segmentation analysis complete.")
+    logger.info("Outputs saved to: %s", cfg['data']['output_dir'])
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,41 @@
+# Runtime data directories — not committed
+IMAGES/
+MASKS/
+PREDICTIONS/
+
+# Model weights — downloaded automatically by Ultralytics
+*.pt
+*.onnx
+
+# Training run outputs
+runs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env
